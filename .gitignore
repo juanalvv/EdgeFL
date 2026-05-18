@@ -6,3 +6,22 @@ edgefl/tmp_dir/
 edgefl/logs/
 .idea/
 edgefl/data/chest_xrays_bbox/raw/
+
+# Private conversation/debug notes
+ASK_ROY_ROLLBACK.md
+BLOCKCHAIN_VS_JSON_LAYER.md
+DEBUG_HANDOFF.md
+DEBUG_ROLLBACK_EVENTS_ANYLOG.md
+DIAGRAMS.md
+HANDOFF_ACCURACY_LOGGING.md
+HANDOFF_EDGEFL_ONBOARDING.md
+ROLLBACK_MINDMAP.md
+edgefl/platform_components/node/ROLLBACK.md
+
+# Docs excluded from this push (debug sessions, private notes, earlier drafts)
+docs/rollback_debug_guide.md
+docs/rollback_debug_session.tex
+docs/testing_autorollback.md
+docs/federated_learning_explainer.tex
+docs/pipeline_walkthrough_qa.tex
+docs/rollback_user_manual.tex
