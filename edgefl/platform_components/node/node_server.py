@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from platform_components.lib.logger.logger_config import configure_logging
 
+from platform_components.benchmarking.benchmarker import Benchmarker
 
 warnings.filterwarnings("ignore")
 
@@ -42,6 +43,16 @@ configure_logging(f"node_server_{edgelake_node_port}")
 
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)  # Excludes WARNING, ERROR, CRITICAL
+
+# BENCH - Initialize Benchmarking
+_bench_conn = os.getenv("BENCHMARKER_REST_CONN") or os.getenv("EXTERNAL_IP")
+if not _bench_conn:
+    raise RuntimeError("Neither BENCHMARKER_REST_CONN nor EXTERNAL_IP is set; cannot init Benchmarker.")
+
+_bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+
+bench = Benchmarker(_bench_endpoint)
+
 
 # Initialize the Node instance
 node_instance = None
@@ -121,7 +132,7 @@ def init_node(request: InitNodeRequest):
         }
     except ValueError as e:
         raise ValueError(
-            f"No data found in the database: {os.getenv("LOGICAL_DATABASE")}"
+            f"No data found in the database: {os.getenv('LOGICAL_DATABASE')}"
         )
     except HTTPException as e:
         raise HTTPException(
@@ -161,12 +172,29 @@ def listen_for_start_round(nodeInstance, index, stop_event):
 
                 if round_data:
                     logger.debug(f"[{index}] Round Data: {round_data}")  # Debugging line
+
+                    # benchmarking
+                    round_start_ts = time.time()
+                    #
+
                     paramsLink = round_data.get('initParams', '')
                     ip_port = round_data.get('ip_port', '')
                     rest_ip_port = round_data.get('rest_ip_port', '')
                     modelUpdate_metadata = nodeInstance.train_model_params(paramsLink, current_round, ip_port, rest_ip_port, index)
                     nodeInstance.add_node_params(current_round, modelUpdate_metadata, index)
+
+                    # benchmarking 
+                    round_end_ts = time.time()
+                    #
+
                     logger.info(f"[{index}][Round {current_round}] Step 3 Complete: Model parameters published")
+                    
+                    # benchmarking
+                    training_time_ts = round_end_ts - round_start_ts
+                    logger.info(f"Benchmarker: training time -> {training_time_ts}")
+                    bench.record_simple_metric(index, current_round, nodeInstance.replica_name, "training_time_s", training_time_ts)
+                    #
+
                     current_round += 1
                     logger.info(f"[{index}][Round {current_round}] Listening for start round {current_round}")
 
