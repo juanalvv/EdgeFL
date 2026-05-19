@@ -21,8 +21,7 @@ BENCHMARK_REST_CONN="127.0.0.1:32149"
 3. Run `connect dbms benchmarkfl where type = sqlite and memory = false`
 4. Run `get databases` and verify that the benchmarkfl db appears
 5. Run some round of training (ingest data, spin up the node servers, use gui...)
-6. Verify operators are sending the data -> run `get streaming` in each operator's container
-7. In the operator1, run `sql benchmarkfl "select * from fl_benchmarks"`, we should see a list containing one json entry per node per round.
+6. In the operator1, run `sql benchmarkfl "select * from fl_benchmarks"`, we should see a list containing one json entry per node per round.
 ```
 {"row_id": 1,
             "insert_timestamp": "2026-05-19 05:18:33.188097",
@@ -59,3 +58,4 @@ BENCHMARK_REST_CONN="127.0.0.1:32149"
 ### Bugs I found while implementing this
 - Only node1 appears in the benchmarkfl dbms -> Check if the `BENCHMARK_REST_CONN` is correctly set in the corresponding env file.
     - If the `BENCHMARK_REST_CONN` isn't properly set, the system falls back to EXTERNAL_IP, which means each node will send it to itself, explaining why you're not seeing it appear in operator1's benchmarking dbms.
+- For some unknown reason, operators 2 and 3 don't show in the `get streaming` output the rows streamed to operator1. To be expected if you have this bug. However, the data IS SENT and appears correctly in its expected place, check with step 6 from guide above.
