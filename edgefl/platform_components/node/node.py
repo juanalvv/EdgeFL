@@ -116,12 +116,12 @@ class Node:
                     'message': f'Index "{index}" already has a module: "{self.module_names[index]}"'
                 }
             elif index_data: # module already stored in blockchain but not cache, so fetch
-                self.logger.info(f'Index "{index}" already has a module in the blockchain: "{index_data['module_name']}". Fetching now.')
+                self.logger.info(f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.')
                 self.module_names[index] = index_data['module_name']
                 self.module_paths[index] = index_data['module_path']
                 return {
                     'status': 'success',
-                    'message': f'Index "{index}" already has a module in the blockchain: "{index_data['module_name']}". Fetching now.'
+                    'message': f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.'
                 }
 
             # New index, so set new module

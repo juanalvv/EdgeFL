@@ -3,6 +3,7 @@ This Source Code Form is subject to the terms of the Mozilla Public
 License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at http://mozilla.org/MPL/2.0/
 """
+import traceback
 from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
 
@@ -30,6 +31,7 @@ from pydantic import BaseModel
 
 from platform_components.lib.logger.logger_config import configure_logging
 
+from platform_components.benchmarking.benchmarker import Benchmarker
 
 warnings.filterwarnings("ignore")
 
@@ -42,6 +44,16 @@ configure_logging(f"node_server_{edgelake_node_port}")
 
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)  # Excludes WARNING, ERROR, CRITICAL
+
+# BENCH - Initialize Benchmarking
+_bench_conn = os.getenv("BENCHMARK_REST_CONN") or os.getenv("EXTERNAL_IP")
+if not _bench_conn:
+    raise RuntimeError("Neither BENCHMARK_REST_CONN nor EXTERNAL_IP is set; cannot init Benchmarker.")
+
+_bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+
+_bench_enabled = os.getenv("BENCHMARK_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+bench = Benchmarker(_bench_endpoint, enabled=_bench_enabled)
 
 # Initialize the Node instance
 node_instance = None
@@ -121,7 +133,7 @@ def init_node(request: InitNodeRequest):
         }
     except ValueError as e:
         raise ValueError(
-            f"No data found in the database: {os.getenv("LOGICAL_DATABASE")}"
+            f"No data found in the database: {os.getenv('LOGICAL_DATABASE')}"
         )
     except HTTPException as e:
         raise HTTPException(
@@ -138,6 +150,10 @@ def listen_for_start_round(nodeInstance, index, stop_event):
     current_round = nodeInstance.round_number[index]
 
     logger.info(f"[{index}][Round {current_round}] Listening for start round {current_round}")
+
+    # benchmarking: mark beginning of polling time for this round
+    listen_start_ts = time.time()
+
     while True:
         try:
             headers = {
@@ -161,14 +177,43 @@ def listen_for_start_round(nodeInstance, index, stop_event):
 
                 if round_data:
                     logger.debug(f"[{index}] Round Data: {round_data}")  # Debugging line
+
+                    # benchmarking: mark beginning of training time
+                    round_start_ts = time.time()
+                    #
+
                     paramsLink = round_data.get('initParams', '')
                     ip_port = round_data.get('ip_port', '')
                     rest_ip_port = round_data.get('rest_ip_port', '')
                     modelUpdate_metadata = nodeInstance.train_model_params(paramsLink, current_round, ip_port, rest_ip_port, index)
                     nodeInstance.add_node_params(current_round, modelUpdate_metadata, index)
+
+                    # benchmarking: mark end of training time
+                    round_end_ts = time.time()
+                    #
+
                     logger.info(f"[{index}][Round {current_round}] Step 3 Complete: Model parameters published")
+                    
+                    # benchmarking
+                    training_time_s = round_end_ts - round_start_ts
+                    polling_time_s = round_start_ts - listen_start_ts
+                    total_round_time_s = round_end_ts - listen_start_ts
+                    logger.info(
+                            f"Benchmarker [{index}][Round {current_round}] "
+                            f" * training time={training_time_s:.3f}s"
+                            f" * polling time={polling_time_s:.3f}s"
+                            f" * total round time={total_round_time_s:.3f}s"
+                    )
+                    bench.record_simple_metric(index, current_round, nodeInstance.replica_name, "training_time_s", training_time_s)
+                    bench.record_simple_metric(index, current_round, nodeInstance.replica_name, "polling_time_s", polling_time_s)
+                    bench.record_simple_metric(index, current_round, nodeInstance.replica_name, "total_round_time_s", total_round_time_s)
+                    #
+
                     current_round += 1
                     logger.info(f"[{index}][Round {current_round}] Listening for start round {current_round}")
+
+                    # benchmarking: reset polling clock for next round
+                    listen_start_ts = time.time()
 
             time.sleep(5)  # Poll every 2 seconds
         except Exception as e:
