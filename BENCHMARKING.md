@@ -38,3 +38,12 @@ AL operator1 +> sql benchmarkfl "select count(*) from fl_benchmarks where round_
                 "Time":"00:00:00",
                 "Nodes": 1}]}
 ```
+
+## Known issues
+- **`initialize_training_app_on_index` no longer guards against load failures.** During the
+  accuracy/rollback integration, Ivan's branch removed the `try/except` that previously
+  wrapped the training-app load in `node.py:initialize_training_app_on_index` (it used to
+  return a `{'status': 'error', ...}` dict on failure). We accepted his version, so a failure
+  while loading the training application for an index now propagates out of `/init-node`
+  instead of being logged and swallowed. This conflicts with the project rule that the
+  software should never stop on random errors — revisit if init-time crashes appear.
