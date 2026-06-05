@@ -9,6 +9,9 @@ import os
 import pickle
 from asyncio import sleep
 
+import json      # needed to serialize accuracy rows before sending to AnyLog
+import requests   # needed to PUT accuracy data to AnyLog REST endpoint
+
 # import numpy as np
 
 from platform_components.EdgeLake_functions.blockchain_EL_functions import insert_policy, check_policy_inserted, \
@@ -51,6 +54,10 @@ class Node:
         self.tmp_dir = os.path.join(self.github_dir, os.getenv("TMP_DIR"), self.replica_name)
         self.training_application_dir = os.path.join(self.github_dir, os.getenv("TRAINING_APPLICATION_DIR"))
         self.docker_file_write_destination = None
+
+        # Rollback state: set by rollback_to_round(), consumed by train_model_params()
+        self._rollback_pending = {}  # {index: bool} — skip initParams download next round
+        self._stale_round = {}       # {index: int}  — which round was rolled back to
         # =====
 
         if os.getenv("EDGELAKE_DOCKER_RUNNING").lower() == "false":
@@ -86,15 +93,9 @@ class Node:
             
 
     def initialize_training_app_on_index(self, index):
-        try:
-            training_app_path = os.path.join(self.training_application_dir, self.module_paths[index])
-            TrainingApp_class = load_class_from_file(training_app_path, self.module_names[index]) # TODO: this takes too long
-            self.data_handlers[index] = TrainingApp_class(self.replica_name) # Create an instance at index
-        except Exception as e: # TODO: raise an actual Error
-            return {
-                'status': 'error',
-                'message': str(e)
-            }
+        training_app_path = os.path.join(self.training_application_dir, self.module_paths[index])
+        TrainingApp_class = load_class_from_file(training_app_path, self.module_names[index]) # TODO: this takes too long
+        self.data_handlers[index] = TrainingApp_class(self.replica_name) # Create an instance at index
 
     # On startup, indexes, modules, and module_paths caches are empty, so refill
     def fetch_indexes_and_modules(self):
@@ -116,12 +117,12 @@ class Node:
                     'message': f'Index "{index}" already has a module: "{self.module_names[index]}"'
                 }
             elif index_data: # module already stored in blockchain but not cache, so fetch
-                self.logger.info(f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.')
+                self.logger.info(f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.')   #3.11fix '' => ""
                 self.module_names[index] = index_data['module_name']
                 self.module_paths[index] = index_data['module_path']
                 return {
                     'status': 'success',
-                    'message': f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.'
+                    'message': f'Index "{index}" already has a module in the blockchain: "{index_data["module_name"]}". Fetching now.' #3.11fix '' => ""
                 }
 
             # New index, so set new module
@@ -208,48 +209,68 @@ class Node:
         - Uses updated aggregator model params and updates local model
         - Gets local data and runs training on updated model
     '''
-    def train_model_params(self, aggregator_model_params_db_link, round_number, ip_ports, rest_ip_port, index):
+    # Comes in from 
+    # CORE FUNCTION. In order:
+    # Round 1: Calls data_handler.get_weights() - user the initial random wegiths TODO: check what these are 
+    # Round 2+: Download the aggregated .json file, deserialize via pickle.load(), extract newUpdates -> decode weights
+    # 3) Data_handler.update_model(weights) - load those weights into the local Keras model TODO: Learn more about keras model
+    # 4) run_inference() -> capture the initial_accuracy (baseline before training)
+    # 5) data_hadnler.train(round_number) -> Local training runs
+    # 6) run_inference() -> capture the final_accruacy (how much this node improved)
+    # 7) pickle.dumps(model_params) -> serialize new weights
+    # 8) save to disk as {round}-replica-{node_name}.pkl
+    # 9) return {'model_path': ..., 'initial_accuracy': ..., 'final_accuracy': ...}
+    def train_model_params(self, aggregator_model_params_db_link, round_number, ip_ports, rest_ip_port, index, skip_download=False):
         self.logger.debug(f"[{index}] in train_model_params for round {round_number}")
 
         # First round initialization
         if round_number == 1 and not aggregator_model_params_db_link:
             weights = self.data_handlers[index].get_weights()
+            self.data_handlers[index].update_model(weights)
+        elif skip_download:
+            # Rollback active: model already holds the rolled-back weights — skip fetch and load.
+            # This round's gradient will be stale relative to W_agg_{round_number - 1}.
+            stale_from = self._stale_round.get(index, '?')
+            self.logger.warning(
+                f"[{index}] Round {round_number}: training from rolled-back weights "
+                f"(W_agg_{stale_from}) instead of W_agg_{round_number - 1}. "
+                f"This node's update will be stale. Consider staleness-aware aggregation."
+            )
         else:
             try:
-                # Extract the key from the URL
                 filename = aggregator_model_params_db_link.split('/')[-1]
                 if self.docker_running:
-                    # response = read_file(rest_ip_port, aggregator_model_params_db_link,
-                    #                      f'{self.docker_file_write_destination}/{index}/{filename}', ip_ports)
-                    response = copy_file_from_container(os.path.join(self.tmp_dir, index), self.docker_container_name, rest_ip_port,aggregator_model_params_db_link, f'{self.file_write_destination}/{index}/{filename}', ip_ports)
+                    response = copy_file_from_container(os.path.join(self.tmp_dir, index), self.docker_container_name, rest_ip_port, aggregator_model_params_db_link, f'{self.file_write_destination}/{index}/{filename}', ip_ports)
                 else:
                     response = read_file(rest_ip_port, aggregator_model_params_db_link, f'{self.file_write_destination}/{index}/{filename}', ip_ports)
 
                 if response.status_code == 200:
                     sleep(1)
-                    with open(
-                            f'{self.file_write_destination}/{index}/{filename}',
-                            'rb') as f:
+                    with open(f'{self.file_write_destination}/{index}/{filename}', 'rb') as f:
                         data = pickle.load(f)
 
-                # Ensure the data is valid and decode the parameters
                 if data and 'newUpdates' in data:
                     weights = self.decode_params(data['newUpdates'])
                 else:
                     self.logger.error(f"[{index}] Invalid data or 'newUpdates' missing in Firestore response: {data}")
                     raise ValueError(f"[{index}] Invalid data or 'newUpdates' missing in Firestore response: {data}")
+
+                self.data_handlers[index].update_model(weights)
             except Exception as e:
                 self.logger.error(f"[{index}] Error getting weights: {str(e)}")
                 raise
-
-        # Update model with weights
-        self.data_handlers[index].update_model(weights)
+        
+        # Accuracy of the aggregator's global weights on this node's local test set (pre-training baseline)
+        initial_accuracy = self.data_handlers[index].run_inference()
 
         # Train model
         # model_update = self.local_training_handler.train({})
         # print(f"[INFO] [{index}][Round {round_number}] ========== Model training progress ==========")
         model_params = self.data_handlers[index].train(round_number)
         self.logger.info(f"[{index}][Round {round_number}] Step 2 Complete: Model training done")
+        
+        # Accuracy after local training — change from initial_accuracy shows this node's contribution
+        final_accuracy = self.data_handlers[index].run_inference()
 
         # Save and return new weights
         encoded_params = self.encode_model(model_params)
@@ -263,8 +284,10 @@ class Node:
         if self.docker_running:
             self.logger.debug(f'[{index}] written to container at {f"{self.docker_file_write_destination}/{index}/{file}"}')
             copy_file_to_container(os.path.join(self.tmp_dir, index), self.docker_container_name, self.edgelake_node_url, file_name, f"{self.docker_file_write_destination}/{index}/{file}")
-            return f'{self.docker_file_write_destination}/{index}/{file}'
-        return file_name
+            # Return dict so the caller gets the model path AND both accuracy snapshots for storage
+            return {'model_path': f'{self.docker_file_write_destination}/{index}/{file}', 'initial_accuracy': initial_accuracy, 'final_accuracy': final_accuracy}
+        # Return dict so the caller gets the model path AND both accuracy snapshots for storage
+        return {'model_path': file_name, 'initial_accuracy': initial_accuracy, 'final_accuracy': final_accuracy}
 
     def encode_model(self, model_update):
         # serialized_data = gzip.compress(pickle.dumps(model_update)) # maybe, so that we don't stored super large models as is
@@ -281,3 +304,72 @@ class Node:
 
     def direct_inference(self, index, data):
         return self.data_handlers[index].direct_inference(data)
+
+    def rollback_to_round(self, index: str, round_num: int, reason: str = "manual", trigger_type: str = "manual") -> dict:
+        """
+        Find the aggregator-published model for round_num, fetch and load its weights,
+        update round state, and log the event.
+        Raises ValueError/RuntimeError on failure so the caller can return a clean error response.
+        """
+        from platform_components.node.rollback_manager import (
+            find_roundstart_policy, fetch_and_load_weights, log_rollback_event
+        )
+
+        from_round = self.round_number.get(index, 0)
+
+        # Round N's aggregated weights (W_agg_N) are published as the initParams
+        # of round N+1's RoundStart policy — not round N's.  Fetching round N's
+        # policy would give W_agg_{N-1}, which predates the round we want.
+        policy = find_roundstart_policy(index, round_num + 1, self.edgelake_node_url)
+        if not policy:
+            log_rollback_event(self, index, trigger_type, from_round, round_num, reason, "error")
+            raise ValueError(
+                f"No RoundStart policy found for round {round_num + 1} "
+                f"(required to restore aggregated weights from round {round_num})"
+            )
+
+        try:
+            model_path = fetch_and_load_weights(self, index, policy)
+        except Exception:
+            log_rollback_event(self, index, trigger_type, from_round, round_num, reason, "error")
+            raise
+
+        # Signal the listener thread to skip initParams next round and train from these weights.
+        self._rollback_pending[index] = True
+        self._stale_round[index] = round_num
+
+        log_rollback_event(self, index, trigger_type, from_round, round_num, reason, "success")
+        self.logger.info(f"[{index}] Rolled back from round {from_round} to round {round_num}")
+
+        return {
+            "status": "success",
+            "rolled_back_to_round": round_num,
+            "model_path": model_path,
+            "message": f"Model rolled back to round {round_num}",
+        }
+
+    def push_accuracy(self, index, round_number, initial_accuracy, final_accuracy, model_path):
+        # Build the row that will be stored in AnyLog under table "node_accuracy"
+        row = {
+            "node_name":        self.replica_name,
+            "index_name":       index,
+            "round_number":     round_number,
+            "initial_accuracy": round(initial_accuracy, 4),
+            "final_accuracy":   round(final_accuracy, 4),
+            "model_path":       model_path
+        }
+        # AnyLog expects data via PUT with these headers to route the row to the right db/table
+        headers = {
+            "type":         "json",
+            "dbms":         self.databases[index],   # logical db name, "mnist_fl"
+            "table":        "node_accuracy",
+            "mode":         "streaming",
+            "Content-Type": "text/plain"
+        }
+        try:
+            self.logger.info(f"[{index}] Pushing accuracy row: {row}")
+            response = requests.put(url=self.edgelake_node_url, data=json.dumps(row), headers=headers)
+            # Log the status code so we can confirm AnyLog accepted the row
+            self.logger.info(f"[{index}][Round {round_number}] Accuracy stored: initial={initial_accuracy:.2f}%  final={final_accuracy:.2f}%  status={response.status_code}")
+        except Exception as e:
+            self.logger.error(f"[{index}] Failed to push accuracy: {str(e)}")
