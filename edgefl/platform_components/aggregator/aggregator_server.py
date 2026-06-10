@@ -61,16 +61,27 @@ port = os.getenv("SERVER_PORT", "8080")
 aggregator = Aggregator(ip, port, logger)
 
 # Initialize benchmarker
-_bench_conn = os.getenv("BENCHMARK_REST_CONN") or os.getenv("EXTERNAL_IP")
-if not _bench_conn:
-    logger.error("Neither BENCHMARK_REST_CONN nor EXTERNAL_IP is set; cannot init Benchmarker.")
-
-_bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+# The aggregator never falls back to EXTERNAL_IP, as it points to a master node
+# and master node does not have an Operator process and would silently dropt the 
+# metrics being recorded. It must be pointed explicitly to an operator via BENCHMARK_REST_CONN 
+_bench_conn = os.getenv("BENCHMARK_REST_CONN")
 
 _bench_enabled = os.getenv("BENCHMARK_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
+if _bench_enabled and not _bench_conn:
+    logger.info("Benchmarking fallback disabled in aggregator. Set aggregator's BENCHMARK_REST_CONN to point to an operator.")
+    logger.warning("Benchmarker disabled.")
+    _bench_enabled = False
+
+_bench_endpoint = None
+if _bench_conn:
+    _bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+
+
 bench = Benchmarker(_bench_endpoint, enabled=_bench_enabled)
 
-logger.info(f"BENCHMAKER INITIALIZED IN AGG SERVER")
+# DEBUG 
+# logger.info(f"BENCHMAKER INITIALIZED IN AGG SERVER")
 
 # Track the training process of each index so that they can join once they're done
 training_processes = {}
@@ -424,8 +435,8 @@ async def listen_for_update_agg(min_params, round_number, index):
     check_chances = 5 # Once this reaches <= 0, we will ignore min_params and handle accordingly
 
     # benchmarking: per-node param arrival tracking (straggler id and arrival time span)
-    param_arrival_ts = {} # { node_params_link: first time it appeared in decoded_params }
-    link_to_node = {}     # { node_params_link: node_name }
+    publish_ts_by_link = {} # { node_params_link: node reported published_ts }
+    link_to_node = {}     #  { node_params_link: node_name }
 
     while True:
         try:
@@ -465,6 +476,20 @@ async def listen_for_update_agg(min_params, round_number, index):
                 ]
                 link_to_node.update(dict(zip(node_params_links, node_names)))
 
+                # Added to compute benchmarker straggler gap
+                published_ts_list = [
+                        item.get(index).get('published_ts')
+                        for item in result
+                        if index in item
+                ]
+                link_to_node.update(dict(zip(node_params_links, node_names)))
+                publish_ts_by_link.update({
+                    link: ts
+                    for link, ts in zip(node_params_links, published_ts_list)
+                    if ts is not None
+                })
+
+
                 # Updates decoded_params with newly fetched decoded params (with node link as key)
                 aggregator.fetch_decoded_params(
                     decoded_params_dict=decoded_params,
@@ -474,18 +499,22 @@ async def listen_for_update_agg(min_params, round_number, index):
                     index=index
                 )
 
-            # benchmarking: mark time in first poll cycle
-            now = time.time()
-            for link in decoded_params:
-                param_arrival_ts.setdefault(link, now)
-            
             # If enough parameters or not getting ALL parameters in time, get the URL
             if len(decoded_params) >= min_params or (decoded_params and not check_chances):
-                # benchmarking: last params to arrive = the straggler node
-                first_ts = min(param_arrival_ts.values())
-                straggler_link = max(param_arrival_ts, key=param_arrival_ts.get)
-                # logger.info(f"\n\n[DEBUG]: param_arrival_ts={param_arrival_ts[straggler_link]}-first_ts = {param_arrival_ts[straggler_link] - first_ts}")
-                first_to_last_arrival_s = param_arrival_ts[straggler_link] - first_ts
+                # benchmarking: straggler = last node-published update among those that arrived
+                arrived = {link: publish_ts_by_link[link]
+                           for link in decoded_params
+                           if link in publish_ts_by_link}
+
+                if len(arrived) >= 2:
+                    first_ts = min(arrived.values())
+                    straggler_link = max(arrived, key=arrived.get)
+                    first_to_last_arrival_s = arrived[straggler_link] - first_ts
+                else:
+                    # single node, or ts unavailable -> nodes not yet redeployed
+                    straggler_link = next(iter(decoded_params), None)
+                    first_to_last_arrival_s = 0.0
+
                 straggler_node = link_to_node.get(straggler_link, "unknown")
                 digits = ''.join(ch for ch in straggler_node if ch.isdigit())
                 straggling_node_id = int(digits) if digits else -1
@@ -500,12 +529,7 @@ async def listen_for_update_agg(min_params, round_number, index):
 
                 # benchmarking: 
                 aggregation_time_s = time.time() - agg_start_ts
-                logger.info(
-                    f"Benchmarker [{index}][Round {round_number}][agg]\n"
-                    f"\t* aggregation time = {aggregation_time_s:.3f}s\n"
-                    f"\t* first->last arrival = {first_to_last_arrival_s:.3f}s\n"
-                    f"\t* straggling node = {straggler_node} (id={straggling_node_id})"
-                )
+                logger.info(f"[{index}][Round {round_number}] Benchmarker: agg time = {aggregation_time_s:.3f}s, time betw. first and last arrival = {first_to_last_arrival_s:.3f}s, straggler node = {straggler_node}")
                 bench.record_simple_metric(index, round_number, "agg", "aggregation_time_s", aggregation_time_s)
                 bench.record_simple_metric(index, round_number, "agg", "first_to_last_arrival_s", first_to_last_arrival_s)
                 bench.record_simple_metric(index, round_number, "agg", "straggling_node_id", straggling_node_id)

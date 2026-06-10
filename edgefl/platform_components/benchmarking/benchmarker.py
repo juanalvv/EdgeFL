@@ -12,26 +12,23 @@ class Benchmarker:
     def __init__(self, endpoint:str, db_name:str = "benchmarkfl", table_name: str = "fl_benchmarks", enabled: bool = True):
         self.enabled = enabled
         if not enabled:
-            logger.info("Benchmarker disabled (BENCHMARK is set to False). No metrics will be recorded.")
+            # logger.info("Benchmarker disabled (BENCHMARK_ENABLED is False). No metrics will be recorded.")
             return
         
         self.endpoint = endpoint
         self.session = requests.Session()
 
-        # Refuse any target that can't ingest streaming data, i.e. master nodes 
-        if not self._verify_target_availability():
-            self.enabled = False
-            logger.warning(
-                "Benchmark target %s has no Operator process running and can't ingest data."
-                "DISABLING BENCHMARKING, point BENCHMARK_REST_CONN at an operator node.", 
-                self.endpoint,
-            )
-            return
+        # Capability probe
+        # if not self._verify_target_availability():
+        #     self.enabled = False
+        #     logger.warning(
+        #         "Benchmark target %s has no Operator process running and can't ingest data."
+        #         "DISABLING BENCHMARKING, point BENCHMARK_REST_CONN at an operator node.", 
+        #         self.endpoint,
+        #     )
+        #    return
 
         self.q = queue.Queue()
-        self.lock = threading.Lock()
-        self.state = {} # json pseudo policy with benchmark
-
         self.metrics = [
                 "training_time_s", 
                 "polling_time_s", 
@@ -53,8 +50,10 @@ class Benchmarker:
         }
 
         self._ensure_dbms_connected()
-        logger.info(f"Benchmarker initialized: \n  endpoint = {self.endpoint}\n  dbms = {db_name}\n  table = {table_name}")
-        # DAEMON Queue thread, run in the background asynchronously
+        # Debug
+        logger.info(f"Benchmarker initialized,  endpoint = {self.endpoint}.")
+        logger.info(f"Benchmarker dbms = {db_name}, table = {table_name}.")
+        # DAEMON Queue thread, runs in the background asynchronously
         self.worker = threading.Thread(target=self._run_worker, daemon=True)
         self.worker.start()
 
@@ -160,8 +159,16 @@ class Benchmarker:
 
                 if response.status_code >= 400:
                     logger.warning(
-                        "Bnechmarker POST failed: %s %s", response.status_code, response.text
+                        "Benchmarker PUT failed: %s %s", response.status_code, response.text
                     )
+                else:
+                    # === DEMO PLACEHOLDER (temporary, remove after presentation) ===
+                    logger.info(
+                        "[DEMO] <<< STORED in benchmarkfl: %s=%s (node=%s, round=%s)",
+                        record["metric_name"], record["metric_value"],
+                        record["node"], record["round_number"],
+                    )
+                    # === END DEMO PLACEHOLDER ===
 
             except requests.exceptions.RequestException as e:
                 logger.error("Benchmarker PUT error: %s", str(e))

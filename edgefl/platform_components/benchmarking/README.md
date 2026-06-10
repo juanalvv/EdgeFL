@@ -44,10 +44,11 @@ You should see one JSON entry per node per round, plus the aggregator's rows. A 
 ```
 AL operator1 +> sql benchmarkfl "select count(*) from fl_benchmarks where round_number = 1"
 
-{"Query":[{"count(*)":23}],
+{"Query":[{"count(*)":15}],
 "Statistics":[{"Count": 1,
                 "Time":"00:00:00",
-                "Nodes": 1}]}```
+                "Nodes": 1}]}
+```
 
 No manual database creation is needed — the `benchmarkfl` database is connected automatically on startup if it isn't already present.
 
@@ -57,11 +58,11 @@ No manual database creation is needed — the `benchmarkfl` database is connecte
 |---|---|---|---|
 | `BENCHMARK_ENABLED` | `True` / `False` | `True` | Master on/off switch for this process. When `False`, the benchmarker is inert: every `record_simple_metric` call returns immediately and nothing is sent or stored. |
 | `BENCHMARK_REST_CONN` | `host:port` | *(unset)* | The REST endpoint that should receive this process's metrics — i.e. the ingesting operator. In the default setup, every process sets this to the same operator node (operator1). |
-| `BENCHMARKER_FALLBACK` | `True` / `False` | `False` | Only relevant when `BENCHMARK_REST_CONN` is **unset**. If `True`, the process sends metrics to its **own** REST address (`EXTERNAL_IP`) instead of a central collector. This is the opt-in switch for the distributed deployment described in "Deployment topology." |
+| `BENCHMARK_FALLBACK` | `True` / `False` | `False` | Only relevant when `BENCHMARK_REST_CONN` is **unset**. If `True`, the process sends metrics to its **own** REST address (`EXTERNAL_IP`) instead of a central collector. This is the opt-in switch for the distributed deployment described in Topology |
 
 Two behaviors worth noting:
 
-- **Fallback is never implicit.** Leaving `BENCHMARK_REST_CONN` unset does *not* silently send metrics to the node's own address — that only happens if you explicitly set `BENCHMARKER_FALLBACK=True`.
+- **Fallback is never implicit.** Leaving `BENCHMARK_REST_CONN` unset does *not* silently send metrics to the node's own address — that only happens if you explicitly set `BENCHMARK_FALLBACK=True`.
 - **If no destination resolves** (no `BENCHMARK_REST_CONN`, and fallback off), the process logs a clear warning telling you which variable to set and disables benchmarking for itself. It does not crash.
 
 ---
@@ -84,12 +85,8 @@ Each measurement is stored as **one row**, tagged with the `training_index`, the
 | Metric | Meaning |
 |---|---|
 | `aggregation_time_s` | Time to combine all nodes' updates into the new global model. |
-| `first_to_last_arrival_s` | Spread between the first and last node's update arriving that round — the "straggler gap." |
-| `straggling_node_id` | Numeric id of the node whose update arrived last (the round's bottleneck). |
-
-> **`round_accuracy` is reused, not recomputed.** The value is the `final_accuracy` already produced by the post-training inference in `train_model_params` (the accuracy/rollback feature). The benchmarker forwards that number; it does **not** run a second inference pass.
-
-> **`straggling_node_id` is an identifier, not a measurement.** It is stored in the same numeric `metric_value` column as the timings (e.g. `3` for `node3`). The schema is kept uniform on purpose; just remember this particular series is a label when reading it.
+| `first_to_last_arrival_s` | Wall-clock spread between the **earliest and latest node finishing and publishing** its update that round, computed from each node's self-reported publish timestamp — the "straggler gap." |
+| `straggling_node_id` | Numeric id of the node that **published last** that round (the straggler / bottleneck). |
 
 ---
 
@@ -191,7 +188,7 @@ Instead of one column per metric (a "wide" table), the data is stored as `(metri
 
 ---
 
-## Deployment topology
+## Topology
 
 The two configuration flags produce two deployment shapes.
 
@@ -210,7 +207,7 @@ There is one place to query, which keeps analytics simple. The trade-off is that
 
 ### Distributed: each node → itself
 
-Leave `BENCHMARK_REST_CONN` unset on the operators and set `BENCHMARKER_FALLBACK=True`. Each operator then writes to its **own local** `benchmarkfl` via `EXTERNAL_IP`.
+Leave `BENCHMARK_REST_CONN` unset on the operators and set `BENCHMARK_FALLBACK=True`. Each operator then writes to its **own local** `benchmarkfl` via `EXTERNAL_IP`.
 
 ```
 node1 ──► operator1 (benchmarkfl)
@@ -227,11 +224,7 @@ Because the storage engine sits behind a logical database name, moving from SQLi
 
 The aggregator's own `EXTERNAL_IP` points at the **master** node. The master is a coordination node with **no Operator process**, so it physically cannot ingest streaming data — a PUT there is silently dropped. Therefore:
 
-> **The aggregator must always send to an operator (ie: operator1). It can never "send to itself."**
-
-The aggregator never enables `BENCHMARKER_FALLBACK`. Because fallback is explicit, an unset `BENCHMARK_REST_CONN` on the aggregator cannot silently resolve to the master; instead the aggregator logs a warning naming the variable to set and disables its own benchmarking rather than writing into the void.
-
-> A startup capability probe (`get processes` on the target, which used to refuse non-ingesting nodes) remains in the code **disabled**, as a documented guard should accidental black-holing ever reappear.
+The aggregator never enables `BENCHMARK_FALLBACK`. Because fallback is explicit, an unset `BENCHMARK_REST_CONN` on the aggregator cannot silently resolve to the master; instead the aggregator logs a warning naming the variable to set and disables its own benchmarking rather than writing into the void.
 
 ---
 
@@ -252,7 +245,7 @@ sql benchmarkfl "select * from fl_benchmarks"
 ```
 sql benchmarkfl "select count(*) from fl_benchmarks where round_number = 1"
 ```
-* If correctly set up, expect 23 rows per round. 3 metrics from 'agg' node, 20 from operator nodes.
+* Expect 15 rows per round.
 
 **Training time per node, ordered by round** — useful for spotting a node that slows down over time:
 
@@ -310,7 +303,7 @@ The new rows appear immediately and are queryable by `metric_name = 'peak_memory
 |---|---|
 | Async queue + daemon worker | Instrumentation never blocks or slows the FL loops. |
 | Never raises — logs and continues | A benchmarking fault can't take down training. |
-| Explicit `BENCHMARKER_FALLBACK` flag | Self-hosting is opt-in; an unset target never silently aims at `EXTERNAL_IP`, so the aggregator can't accidentally fall back to the non-ingesting master. |
+| Explicit `BENCHMARK_FALLBACK` flag | Self-hosting is opt-in; an unset target never silently aims at `EXTERNAL_IP`, so the aggregator can't accidentally fall back to the non-ingesting master. |
 | No resolvable target → disable + warn | The process logs which variable to set and disables benchmarking instead of crashing. |
 | `BENCHMARK_ENABLED` toggle | Benchmarking can be turned off entirely per process; every call site becomes a no-op. |
 | Metric allow-list | Typos in `metric_name` are caught and warned, not silently stored. |

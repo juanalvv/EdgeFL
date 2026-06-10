@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 from asyncio import sleep
+import time
 
 import json      # needed to serialize accuracy rows before sending to AnyLog
 import requests   # needed to PUT accuracy data to AnyLog REST endpoint
@@ -167,13 +168,15 @@ class Node:
     def add_node_params(self, round_number, model_metadata, index):
         self.logger.debug(f"[{index}] in add_node_params")
         try:
+            published_ts = time.time()   # added for straggler benchmarking
             data = f'''<my_policy = {{"{index}" : {{
                                 "node" : "{self.replica_name}",
                                 "round_number" : {round_number},
                                 "policy_type": "submodel",
                                 "index": "{index}",
                                 "node_type": "training",
-                                "ip_port": "{self.edgelake_tcp_node_ip_port}", 
+                                "published_ts": {published_ts},
+                                "ip_port": "{self.edgelake_tcp_node_ip_port}",
                                 "rest_ip_port": "{self.edgelake_node_url}",                              
                                 "trained_params_local_path": "{model_metadata}"
             }} }}>'''

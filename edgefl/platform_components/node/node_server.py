@@ -51,15 +51,34 @@ configure_logging(f"node_server_{edgelake_node_port}")
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)  # Excludes WARNING, ERROR, CRITICAL
 
-# BENCH - Initialize Benchmarking
-_bench_conn = os.getenv("BENCHMARK_REST_CONN") or os.getenv("EXTERNAL_IP")
-if not _bench_conn:
-    raise RuntimeError("Neither BENCHMARK_REST_CONN nor EXTERNAL_IP is set; cannot init Benchmarker.")
+# ------------------------------------------------------------------
+# Benchmarker Initialization block
+# ------------------------------------------------------------------
+_bench_conn = os.getenv("BENCHMARK_REST_CONN") # or os.getenv("EXTERNAL_IP")
 
-_bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+# Benchmarker fallback configuration:
+_bench_fallback = os.getenv("BENCHMARK_FALLBACK", "false").strip().lower() == "true"
+# Only resolve to this node's own REST address when fallback is opted in.
+# If fallback -> If BENCHMARK_REST_CONN is unset, fallback is EXTERNAL_IP.
+if not _bench_conn and _bench_fallback:
+    _bench_conn = os.getenv("EXTERNAL_IP")
 
 _bench_enabled = os.getenv("BENCHMARK_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
+if _bench_enabled and not _bench_conn:
+    logger.info("Benchmarking enabled but no target resolved. Set BENCHMARK_REST_CONN or BENCHMARK_FALLBACK=True.")
+    logger.warning("Benchmarking disabled.")
+    _bench_enabled = False
+
+# _bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+_bench_endpoint = None
+if _bench_conn:
+    _bench_endpoint = _bench_conn if _bench_conn.startswith("http") else f"http://{_bench_conn}"
+
 bench = Benchmarker(_bench_endpoint, enabled=_bench_enabled)
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+
 
 # Initialize the Node instance
 node_instance = None
@@ -261,7 +280,7 @@ def listen_for_start_round(nodeInstance, index, stop_event):
                     polling_time_s = round_start_ts - listen_start_ts
                     total_round_time_s = round_end_ts - listen_start_ts
                     logger.info(
-                            f"Benchmarker [{index}][Round {current_round}] "
+                            f"[{index}][Round {current_round}] Benchmarker "
                             f" * training time={training_time_s:.3f}s"
                             f" * polling time={polling_time_s:.3f}s"
                             f" * total round time={total_round_time_s:.3f}s"
